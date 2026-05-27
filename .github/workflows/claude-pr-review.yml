@@ -1,0 +1,84 @@
+name: Claude PR Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: number
+        required: true
+      repository:
+        type: string
+        required: true
+      base_sha:
+        type: string
+        required: true
+      head_sha:
+        type: string
+        required: true
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Review PR with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REPOSITORY: ${{ inputs.repository }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          # Fetch PR diff via GitHub API (max 50k chars)
+          DIFF=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" \
+            -H "Accept: application/vnd.github.v3.diff" 2>/dev/null | head -c 50000 || echo "")
+
+          if [ -z "$DIFF" ]; then
+            echo "Empty diff — skipping review."
+            exit 0
+          fi
+
+          # PR metadata
+          PR_META=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '"**Title:** " + .title + "\n**Branch:** " + .head.ref + " → " + .base.ref + "\n**Author:** " + .user.login')
+
+          # Build request payload
+          PAYLOAD=$(jq -n \
+            --arg diff "$DIFF" \
+            --arg meta "$PR_META" \
+            '{
+              model: "claude-sonnet-4-6",
+              max_tokens: 2048,
+              system: "You are a senior software engineer doing code review. Review the PR diff for: correctness bugs, security issues (OWASP Top 10), performance problems, and code quality. Be concise and actionable. Group findings by severity:\n- 🔴 **Critical** — must fix before merge\n- 🟡 **Warning** — should address\n- 🟢 **Suggestion** — optional improvement\n\nIf the PR is clean, say so briefly. Skip obvious style nits unless egregious.",
+              messages: [{
+                role: "user",
+                content: ($meta + "\n\n```diff\n" + $diff + "\n```")
+              }]
+            }')
+
+          # Call Claude API
+          RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$PAYLOAD")
+
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // "⚠️ Review failed: could not parse response."')
+
+          # Post review comment
+          gh pr comment "$PR_NUMBER" \
+            --repo "$REPOSITORY" \
+            --body "## 🤖 Claude Code Review
+
+${REVIEW}
+
+---
+*[Claude](https://anthropic.com) · [claude-sonnet-4-6](https://docs.anthropic.com)*"
