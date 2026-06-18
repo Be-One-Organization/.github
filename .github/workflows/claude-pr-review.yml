@@ -37,7 +37,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch PR diff via GitHub API (max 50k chars)
           DIFF=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" \
             -H "Accept: application/vnd.github.v3.diff" 2>/dev/null | head -c 50000 || echo "")
 
@@ -46,25 +45,79 @@ jobs:
             exit 0
           fi
 
-          # PR metadata
           PR_META=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" \
-            --jq '"**Title:** " + .title + "\n**Branch:** " + .head.ref + " → " + .base.ref + "\n**Author:** " + .user.login')
+            --jq '"**Title:** " + .title + "
+**Branch:** " + .head.ref + " → " + .base.ref + "
+**Author:** " + .user.login')
 
-          # Build request payload
+          SYSTEM_PROMPT='You are a senior engineer at Be-One Organization reviewing code. Be concise and actionable. Group findings:
+- 🔴 **Critical** — must fix before merge (security, crashes, data loss)
+- 🟡 **Warning** — should address (logic bugs, perf, standard violations)
+- 🟢 **Suggestion** — optional improvement
+
+If the PR is clean, say so in one line.
+
+## Security (always check — known vulnerabilities in this codebase)
+- Hardcoded credentials, tokens, or API keys in source code
+- Unprotected mutating endpoints (POST/PUT/DELETE without auth guard)
+- GraphQL resolvers missing authorization checks (user can only mutate their own data)
+- Public routes emitting tokens without validation
+- User inputs not validated (missing DTOs with class-validator/Zod)
+- Missing JWT guard on new endpoints
+- SQL injection, XSS, OWASP Top 10
+
+## Backend (NestJS / Express / TypeScript)
+- Raw SQL — use TypeORM query builder or repositories
+- Missing DTOs or Zod validation on inputs
+- In-memory Maps for session/state — use Redis (ioredis)
+- PII not sanitized before calling LLM
+- Service-to-service calls missing bearer token auth
+- Unhandled promise rejections or silent catch blocks
+- console.log in production code
+
+## Frontend (Angular v19+)
+- `*ngFor` / `*ngIf` used — must use `@for` / `@if` / `@switch` control flow syntax
+- `@for` missing `track` expression
+- `BehaviorSubject` where `signal()` suffices for component state
+- Method calls in templates (re-executes on every change detection cycle)
+- Business logic inside presentation/dumb components
+- Direct DOM manipulation — use Renderer2
+- Missing `OnPush` change detection strategy on new components
+- Constructor injection — use `inject()` function instead
+- `any` type used without justification
+- Memory leaks: missing `takeUntilDestroyed`, `take(1)`, or async pipe
+- `<img>` tags without `ngOptimizedImage` directive
+- Lodash or jQuery imports (forbidden)
+- `::ng-deep` usage
+- Inline styles with px units — use rem/em and SCSS variables
+- Interface names prefixed with `I` (use `User` not `IUser`)
+
+## Code Quality (all code)
+- SOLID violations, especially Single Responsibility
+- DRY violations (duplicate logic)
+- Functions doing more than one thing (keep small and focused)
+- Errors caught and silently ignored
+- Missing tests for new logic
+- Barrel file (index.ts) created inside a single component folder instead of category level'
+
           PAYLOAD=$(jq -n \
             --arg diff "$DIFF" \
             --arg meta "$PR_META" \
+            --arg system "$SYSTEM_PROMPT" \
             '{
               model: "claude-sonnet-4-6",
               max_tokens: 2048,
-              system: "You are a senior software engineer doing code review. Review the PR diff for: correctness bugs, security issues (OWASP Top 10), performance problems, and code quality. Be concise and actionable. Group findings by severity:\n- 🔴 **Critical** — must fix before merge\n- 🟡 **Warning** — should address\n- 🟢 **Suggestion** — optional improvement\n\nIf the PR is clean, say so briefly. Skip obvious style nits unless egregious.",
+              system: $system,
               messages: [{
                 role: "user",
-                content: ($meta + "\n\n```diff\n" + $diff + "\n```")
+                content: ($meta + "
+
+```diff
+" + $diff + "
+```")
               }]
             }')
 
-          # Call Claude API
           RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
@@ -73,7 +126,6 @@ jobs:
 
           REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // "⚠️ Review failed: could not parse response."')
 
-          # Post review comment
           gh pr comment "$PR_NUMBER" \
             --repo "$REPOSITORY" \
             --body "## 🤖 Claude Code Review
